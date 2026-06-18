@@ -1,5 +1,11 @@
 # Kokoro TTS Hook for Claude Code
 
+Run without hooks etc:
+
+```sh
+uv run --project /Users/pawelparadysz/code/claude-code-tts python scripts/tts_watch.py
+```
+
 Automatic TTS (text-to-speech) integration for Claude Code using the [Kokoro TTS model](https://github.com/nazdridoy/kokoro-tts). This project provides voice feedback that reads Claude's responses aloud as you work.
 
 ## Features
