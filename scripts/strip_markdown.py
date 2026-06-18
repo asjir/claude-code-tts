@@ -123,6 +123,11 @@ def strip_markdown(text: str) -> str:
     # Decode HTML entities (e.g., &amp; -> &, &lt; -> <)
     result = html.unescape(result)
 
+    # Verbalize version/decimal numbers: 4.8 -> "4 point 8" (handles 4.8.2 too)
+    result = re.sub(r"(\d)\.(?=\d)", r"\1 point ", result)
+    # Otherwise treat dots between word chars as separators: file.txt -> "file txt"
+    result = re.sub(r"(\w)\.(?=\w)", r"\1 ", result)
+
     # Final whitespace cleanup (emoji removal may leave gaps)
     result = re.sub(r"\s+", " ", result)
 

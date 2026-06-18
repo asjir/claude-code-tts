@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -248,6 +249,16 @@ def load_kokoro():
     return _kokoro
 
 
+def verbalize(text: str) -> str:
+    """Make dotted tokens read better aloud.
+
+    "4.8" -> "4 point 8" (handles 4.8.2 too); other word.word dots like
+    "config.yaml" become spaces so filenames aren't read as one word."""
+    text = re.sub(r"(\d)\.(?=\d)", r"\1 point ", text)
+    text = re.sub(r"(\w)\.(?=\w)", r"\1 ", text)
+    return text
+
+
 def play_tts(text: str) -> None:
     global _playback_thread
     _playback_thread = threading.Thread(target=_play_worker, args=(text,), daemon=True)
@@ -308,6 +319,7 @@ def speak(text: str, label: str) -> None:
     rewarm_async()
     if not summary:
         return
+    summary = verbalize(summary)
     print(summary, flush=True)
     try:
         play_tts(summary)
