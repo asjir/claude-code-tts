@@ -14,7 +14,6 @@ import time
 from pathlib import Path
 
 import summarizer
-from summarizer import ensure_server, rewarm_async, summarize, verbalize, warm_model
 
 REPO_DIR = Path(__file__).resolve().parent.parent
 PROJECTS_ROOT = Path.home() / ".claude/projects"
@@ -79,41 +78,48 @@ def latest_session_file() -> Path:
     return files[-1]
 
 
-def extract_assistant_text(line: str) -> str | None:
+def classify_turn(line: str) -> tuple[str, str] | None:
+    """Classify a JSONL line as a new human prompt or an assistant text turn.
+
+    Returns ("human_prompt", text), ("assistant_text", text), or None.
+    Tool-result echoes (also `type: "user"`) are filtered out by checking
+    `origin.kind == "human"` and a string content body."""
     try:
         rec = json.loads(line)
     except json.JSONDecodeError:
         return None
-    if rec.get("type") != "assistant":
-        return None
+    rec_type = rec.get("type")
     msg = rec.get("message") or {}
-    parts = []
-    for block in msg.get("content") or []:
-        if block.get("type") == "text":
-            parts.append(block.get("text", ""))
-    text = "\n".join(p for p in parts if p).strip()
-    return text or None
-
-
-def last_assistant_text(path: Path) -> str | None:
-    last = None
-    with path.open("r", encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            t = extract_assistant_text(line)
-            if t:
-                last = t
-    return last
+    if rec_type == "user":
+        if (rec.get("origin") or {}).get("kind") != "human":
+            return None
+        content = msg.get("content")
+        if not isinstance(content, str):
+            return None
+        text = content.strip()
+        return ("human_prompt", text) if text else None
+    if rec_type == "assistant":
+        parts = []
+        for block in msg.get("content") or []:
+            if block.get("type") == "text":
+                parts.append(block.get("text", ""))
+        text = "\n".join(p for p in parts if p).strip()
+        return ("assistant_text", text) if text else None
+    return None
 
 
 def follow(path: Path):
-    """Yield new lines as they're appended. Re-opens if the active file rotates."""
+    """Yield (session_id, line) pairs as they're appended.
+
+    Re-opens if the active file rotates; the session id is the JSONL stem
+    so summarizer can keep one history per Claude Code session."""
     current = path
     fh = current.open("r", encoding="utf-8", errors="replace")
     fh.seek(0, 2)  # skip backlog; only react to new turns
     while True:
         line = fh.readline()
         if line:
-            yield line
+            yield current.stem, line
             continue
         time.sleep(POLL_SECONDS)
         newest = latest_session_file()
@@ -223,18 +229,17 @@ def _play_worker(text: str) -> None:
         print(f"[tts] streaming playback failed: {e}", file=sys.stderr)
 
 
-def speak(text: str, label: str) -> None:
+def speak(session_id: str, text: str, label: str) -> None:
     snippet = text.replace("\n", " ")[:80]
     print(f"[tts] {label}: {snippet}{'...' if len(text) > 80 else ''}", file=sys.stderr)
     try:
-        summary = summarize(text)
+        summary = summarizer.summarize(session_id, text)
     except Exception as e:
         print(f"[tts] summarize failed: {e}", file=sys.stderr)
         return
-    rewarm_async()
     if not summary:
         return
-    summary = verbalize(summary)
+    summary = summarizer.verbalize(summary)
     print(summary, flush=True)
     try:
         play_tts(summary)
@@ -253,18 +258,23 @@ def main() -> None:
     if len(sys.argv) > 1:
         _scope_dir = resolve_scope(sys.argv[1])
         print(f"[tts] scoped to {_scope_dir.name}", file=sys.stderr)
-    ensure_server()
-    warm_model()
+    summarizer.ensure_server()
+    summarizer.warm_model()
     session = latest_session_file()
     _voice = voice_for_session(session)
     load_kokoro()
     print(f"[tts] watching {session.name} (voice: {_voice})", file=sys.stderr)
     print("[tts] ready, waiting for new turns", file=sys.stderr)
-    for line in follow(session):
-        text = extract_assistant_text(line)
-        if not text:
+    for session_id, line in follow(session):
+        turn = classify_turn(line)
+        if turn is None:
             continue
-        speak(text, "new")
+        kind, text = turn
+        if kind == "human_prompt":
+            print(f"[tts] new prompt in {session_id[:8]}, resetting", file=sys.stderr)
+            summarizer.begin_user_prompt(session_id, text)
+        elif kind == "assistant_text":
+            speak(session_id, text, "new")
 
 
 if __name__ == "__main__":
