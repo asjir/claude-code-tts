@@ -69,9 +69,47 @@ _state_lock = threading.Lock()
 # unload) so the async rewarm thread can't collide with a real summarize.
 _runtime_lock = threading.Lock()
 
+# Idle unload: another client (e.g. the Ollama desktop app) may keep pinging
+# the server and resetting its keep_alive timer, so the model would stay
+# resident even when we're idle. We track our own activity and force an
+# unload after IDLE_TIMEOUT seconds of no calls from this process. 6 minutes
+# is one minute past Claude Code's default 5-minute idle window, so on a
+# typical setup this fires only when the user has stopped working.
+IDLE_TIMEOUT = 360.0
+_idle_timer: threading.Timer | None = None
+_idle_timer_lock = threading.Lock()
+
 
 def _chain_id_for(prompt: str) -> str:
     return hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:12]
+
+
+def _bump_idle_timer() -> None:
+    """Reset the idle-unload countdown. Called after every activity that
+    would have kept Ollama's own keep_alive alive."""
+    global _idle_timer
+    with _idle_timer_lock:
+        if _idle_timer is not None:
+            _idle_timer.cancel()
+        _idle_timer = threading.Timer(IDLE_TIMEOUT, _idle_unload)
+        _idle_timer.daemon = True
+        _idle_timer.start()
+
+
+def _idle_unload() -> None:
+    print(
+        f"[tts] idle for {IDLE_TIMEOUT/60:.0f}m, unloading {MODEL}",
+        file=sys.stderr,
+    )
+    _unload_model()
+
+
+def _cancel_idle_timer() -> None:
+    global _idle_timer
+    with _idle_timer_lock:
+        if _idle_timer is not None:
+            _idle_timer.cancel()
+            _idle_timer = None
 
 
 def _log_io(
@@ -146,6 +184,7 @@ def warm_model() -> None:
         with _runtime_lock:
             result = agent.run_sync("hi", model_settings=WARM_SETTINGS)
         _log_io("warm", {"prompt": "hi"}, {"output": result.output})
+        _bump_idle_timer()
     except Exception as e:
         _log_io("warm", {"prompt": "hi"}, None, error=repr(e))
         raise
@@ -221,6 +260,7 @@ def _rewarm_async(
                 session_id=session_id,
                 chain_id=chain_id,
             )
+            _bump_idle_timer()
         except Exception as e:
             _log_io(
                 "rewarm",
@@ -284,6 +324,7 @@ def summarize(session_id: str, assistant_text: str) -> str:
         session_id=session_id,
         chain_id=chain_id,
     )
+    _bump_idle_timer()
     return output
 
 
@@ -298,7 +339,10 @@ def verbalize(text: str) -> str:
 
 
 def shutdown() -> None:
-    """Stop the ollama server we started (if any)."""
+    """Stop the ollama server we started, or just unload the model if we
+    attached to a pre-existing one (so VRAM is released without disturbing
+    other users of the server)."""
+    _cancel_idle_timer()
     if _ollama_proc is not None and _ollama_proc.poll() is None:
         print("[tts] stopping ollama server...", file=sys.stderr)
         _ollama_proc.terminate()
@@ -306,3 +350,6 @@ def shutdown() -> None:
             _ollama_proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             _ollama_proc.kill()
+        return
+    print(f"[tts] unloading {MODEL}...", file=sys.stderr)
+    _unload_model()
