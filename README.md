@@ -268,6 +268,17 @@ claude-code-tts/
 
 This project uses [uv](https://astral.sh/uv) for Python package management and [pre-commit](https://pre-commit.com/) with [shellcheck](https://www.shellcheck.net/) for shell scripts, [ruff](https://docs.astral.sh/ruff/) for Python linting/formatting, and [pymarkdown](https://github.com/jackdewinter/pymarkdown) for markdown linting.
 
+### Terminology
+
+- **Message**: a single assistant response to be summarized. Each one is either
+  an **update** (an intermediate progress step) or a **final** (the concluding
+  reply of a turn, `stop_reason=end_turn`). The character is tagged into the
+  message body passed to the summarizer (`[PROGRESS UPDATE]` / `[FINAL REPLY]`).
+- **Message chain**: the full sequence for one user turn — a user prompt,
+  followed by one or more updates, ending in a single final. The summarizer
+  keeps one running history per chain so the model can summarize each message
+  in the context of the earlier ones.
+
 ### Setup
 
 ```bash
@@ -290,6 +301,25 @@ uv run pre-commit run --all-files
 ```bash
 # Run pytest test suite
 uv run pytest tests/ -v
+```
+
+### Building a Dataset
+
+Saved Claude Code transcripts (`~/.claude/projects/<project>/*.jsonl`) are a
+complete, replayable corpus: `scripts/build_dataset.py` walks them, re-runs each
+message through the summarizer, and writes one chain per line in the format
+`scripts/view_dataset.py` reads. Replaying — rather than logging live — lets the
+same corpus be re-summarized under different prompts/models to compare behaviour.
+
+```bash
+# Parse + report chains without touching the model (no Ollama needed)
+uv run python scripts/build_dataset.py claude-code-tts --dry-run
+
+# Build a dataset from a project's sessions (hits the Ollama server)
+uv run python scripts/build_dataset.py claude-code-tts -o datasets/base_0.jsonl
+
+# Inspect the result
+uv run python scripts/view_dataset.py datasets/base_0.jsonl
 ```
 
 ## Contributing

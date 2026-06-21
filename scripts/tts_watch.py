@@ -7,7 +7,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
-import json
 import subprocess
 import sys
 import threading
@@ -15,6 +14,7 @@ import time
 from pathlib import Path
 
 import summarizer
+from sessions import classify_turn
 
 REPO_DIR = Path(__file__).resolve().parent.parent
 PROJECTS_ROOT = Path.home() / ".claude/projects"
@@ -99,39 +99,6 @@ def latest_session_file() -> Path:
     if not files:
         sys.exit(f"[tts] no .jsonl files under {root}")
     return files[-1]
-
-
-def classify_turn(line: str) -> tuple[str, str, bool] | None:
-    """Classify a JSONL line as a new human prompt or an assistant text turn.
-
-    Returns ("human_prompt", text, False), ("assistant_text", text, is_final),
-    or None. `is_final` is True when stop_reason == "end_turn", marking the
-    last assistant message of a turn. Tool-result echoes (also `type: "user"`)
-    are filtered out by checking `origin.kind == "human"` and a string content
-    body."""
-    try:
-        rec = json.loads(line)
-    except json.JSONDecodeError:
-        return None
-    rec_type = rec.get("type")
-    msg = rec.get("message") or {}
-    if rec_type == "user":
-        if (rec.get("origin") or {}).get("kind") != "human":
-            return None
-        content = msg.get("content")
-        if not isinstance(content, str):
-            return None
-        text = content.strip()
-        return ("human_prompt", text, False) if text else None
-    if rec_type == "assistant":
-        parts = []
-        for block in msg.get("content") or []:
-            if block.get("type") == "text":
-                parts.append(block.get("text", ""))
-        text = "\n".join(p for p in parts if p).strip()
-        is_final = msg.get("stop_reason") == "end_turn"
-        return ("assistant_text", text, is_final) if text else None
-    return None
 
 
 def follow(path: Path):
@@ -255,11 +222,11 @@ def _play_worker(text: str) -> None:
         print(f"[tts] streaming playback failed: {e}", file=sys.stderr)
 
 
-def speak(session_id: str, text: str, label: str) -> None:
+def speak(session_id: str, text: str, label: str, is_final: bool) -> None:
     snippet = text.replace("\n", " ")[:80]
     print(f"[tts] {label}: {snippet}{'...' if len(text) > 80 else ''}", file=sys.stderr)
     try:
-        summary = summarizer.summarize(session_id, text)
+        summary = summarizer.summarize(session_id, text, is_final)
     except Exception as e:
         print(f"[tts] summarize failed: {e}", file=sys.stderr)
         return
@@ -336,7 +303,7 @@ def main() -> None:
         elif kind == "assistant_text":
             if _only_final and not is_final:
                 continue
-            speak(session_id, text, "new")
+            speak(session_id, text, "new", is_final)
 
 
 if __name__ == "__main__":

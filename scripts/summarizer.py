@@ -9,7 +9,6 @@ Talks to Ollama through its OpenAI-compatible endpoint at /v1."""
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -18,21 +17,14 @@ import sys
 import threading
 import time
 import urllib.request
-from datetime import datetime, timezone
-from pathlib import Path
 
 from pydantic_ai import Agent
-from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
+from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.providers.openai import OpenAIProvider
 
 MODEL = "qwen3.5:2b-mlx"
 OLLAMA_URL = "http://localhost:11434"
-
-REPO_DIR = Path(__file__).resolve().parent.parent
-LOG_DIR = REPO_DIR / "logs"
-LOG_FILE = LOG_DIR / f"ollama-{datetime.now().strftime('%Y%m%d')}.jsonl"
-_log_lock = threading.Lock()
 
 SYSTEM_PROMPT = (
     "You turn an assistant's response into one or two short, spoken sentences. "
@@ -42,7 +34,12 @@ SYSTEM_PROMPT = (
     "or what was found. Output the spoken summary only, no preamble. "
     "Your replies should be laconic."
     "You will receive an ongoing conversation between the user and the assistant; "
-    "summarize ONLY the latest assistant message, treating earlier turns as context."
+    "summarize ONLY the latest assistant message, treating earlier turns as context. "
+    "Each message to summarize is tagged [PROGRESS UPDATE] or [FINAL REPLY]. "
+    "For a progress update, say what the assistant is doing right now, in the "
+    "present tense (e.g. 'Editing the config file'). For a final reply, say what "
+    "was accomplished or found, as a wrap-up. Never read the tag aloud.",
+    "If the message needs the user to read it, only output the prompt for them to do so.",
 )
 
 # Disable Qwen3's <think> chain — we want fast direct summaries, not reasoning.
@@ -61,9 +58,6 @@ _ollama_proc: subprocess.Popen | None = None
 _agent: Agent | None = None
 _histories: dict[str, list[ModelMessage]] = {}
 _pending_prompts: dict[str, str] = {}
-# session_id -> chain_id (sha1[:12] of the originating user prompt). Lets the
-# log group all turns of one assistant chain by `chain_id` post-hoc.
-_chain_ids: dict[str, str] = {}
 _state_lock = threading.Lock()
 # Serializes calls into the Ollama runtime (agent.run_sync, /api/generate
 # unload) so the async rewarm thread can't collide with a real summarize.
@@ -80,10 +74,6 @@ _idle_timer: threading.Timer | None = None
 _idle_timer_lock = threading.Lock()
 
 
-def _chain_id_for(prompt: str) -> str:
-    return hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:12]
-
-
 def _bump_idle_timer() -> None:
     """Reset the idle-unload countdown. Called after every activity that
     would have kept Ollama's own keep_alive alive."""
@@ -98,7 +88,7 @@ def _bump_idle_timer() -> None:
 
 def _idle_unload() -> None:
     print(
-        f"[tts] idle for {IDLE_TIMEOUT/60:.0f}m, unloading {MODEL}",
+        f"[tts] idle for {IDLE_TIMEOUT / 60:.0f}m, unloading {MODEL}",
         file=sys.stderr,
     )
     _unload_model()
@@ -110,31 +100,6 @@ def _cancel_idle_timer() -> None:
         if _idle_timer is not None:
             _idle_timer.cancel()
             _idle_timer = None
-
-
-def _log_io(
-    kind: str,
-    payload: dict,
-    response: dict | None,
-    error: str | None = None,
-    *,
-    session_id: str | None = None,
-    chain_id: str | None = None,
-) -> None:
-    LOG_DIR.mkdir(exist_ok=True)
-    record = {
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "kind": kind,
-        "session_id": session_id,
-        "chain_id": chain_id,
-        "request": payload,
-        "response": response,
-        "error": error,
-    }
-    line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
-    with _log_lock:
-        with LOG_FILE.open("a", encoding="utf-8") as fh:
-            fh.write(line)
 
 
 def ensure_server() -> None:
@@ -180,33 +145,41 @@ def warm_model() -> None:
     summarize call only has to process the new user-message body."""
     print(f"[tts] warming {MODEL}...", file=sys.stderr)
     agent = _get_agent()
-    try:
-        with _runtime_lock:
-            result = agent.run_sync("hi", model_settings=WARM_SETTINGS)
-        _log_io("warm", {"prompt": "hi"}, {"output": result.output})
-        _bump_idle_timer()
-    except Exception as e:
-        _log_io("warm", {"prompt": "hi"}, None, error=repr(e))
-        raise
+    with _runtime_lock:
+        agent.run_sync("hi", model_settings=WARM_SETTINGS)
+    _bump_idle_timer()
+
+
+def reset_chain(session_id: str, text: str) -> None:
+    """Start a new chain for `session_id` without cycling the model.
+
+    Stores the pending user prompt for the first summarize() call and drops
+    prior history. This is the pure state reset; the live path adds a model
+    cycle on top (see begin_user_prompt). The dataset builder uses this
+    directly so the model stays resident while replaying many chains."""
+    with _state_lock:
+        _pending_prompts[session_id] = text
+        _histories.pop(session_id, None)
 
 
 def begin_user_prompt(session_id: str, text: str) -> None:
-    """Start a new assistant chain for `session_id`.
+    """Start a new assistant chain for `session_id` (live path).
 
-    Atomically: stamps a chain_id (sha1[:12] of the prompt) so all turns
-    of the chain share an id in the log, stores the pending user prompt
-    for the first summarize() call, drops prior history, and evicts +
-    asynchronously rewarms the Ollama KV cache so the next call hits a
-    fresh model. Other sessions' histories are untouched, but they'll
-    re-prefill on their next call (model unload is global — there's
-    only one Ollama process)."""
-    chain_id = _chain_id_for(text)
+    Resets chain state, then evicts + asynchronously rewarms the Ollama KV
+    cache so the next call hits a fresh model. Other sessions' histories are
+    untouched, but they'll re-prefill on their next call (model unload is
+    global — there's only one Ollama process)."""
+    reset_chain(session_id, text)
+    _unload_model()
+    _rewarm_async()
+
+
+def get_history(session_id: str) -> list[ModelMessage]:
+    """Return a copy of the accumulated message history for `session_id`.
+
+    Used by the dataset builder to serialize a finished chain."""
     with _state_lock:
-        _pending_prompts[session_id] = text
-        _chain_ids[session_id] = chain_id
-        _histories.pop(session_id, None)
-    _unload_model(session_id=session_id, chain_id=chain_id)
-    _rewarm_async(session_id=session_id, chain_id=chain_id)
+        return list(_histories.get(session_id, []))
 
 
 def forget_session(session_id: str) -> None:
@@ -214,12 +187,9 @@ def forget_session(session_id: str) -> None:
     with _state_lock:
         _histories.pop(session_id, None)
         _pending_prompts.pop(session_id, None)
-        _chain_ids.pop(session_id, None)
 
 
-def _unload_model(
-    *, session_id: str | None = None, chain_id: str | None = None
-) -> None:
+def _unload_model() -> None:
     payload = {"model": MODEL, "keep_alive": 0}
     req = urllib.request.Request(
         f"{OLLAMA_URL}/api/generate",
@@ -228,23 +198,13 @@ def _unload_model(
     )
     try:
         with _runtime_lock:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                body = json.loads(resp.read())
-        _log_io("unload", payload, body, session_id=session_id, chain_id=chain_id)
-    except Exception as e:
-        _log_io(
-            "unload",
-            payload,
-            None,
-            error=repr(e),
-            session_id=session_id,
-            chain_id=chain_id,
-        )
+            with urllib.request.urlopen(req, timeout=10):
+                pass
+    except Exception:
+        pass
 
 
-def _rewarm_async(
-    *, session_id: str | None = None, chain_id: str | None = None
-) -> None:
+def _rewarm_async() -> None:
     """Reload the model through the chat-template path so the system-prompt
     KV prefix is cached before the first real summarize call."""
 
@@ -252,63 +212,54 @@ def _rewarm_async(
         agent = _get_agent()
         try:
             with _runtime_lock:
-                result = agent.run_sync("hi", model_settings=WARM_SETTINGS)
-            _log_io(
-                "rewarm",
-                {"prompt": "hi"},
-                {"output": result.output},
-                session_id=session_id,
-                chain_id=chain_id,
-            )
+                agent.run_sync("hi", model_settings=WARM_SETTINGS)
             _bump_idle_timer()
         except Exception as e:
-            _log_io(
-                "rewarm",
-                {"prompt": "hi"},
-                None,
-                error=repr(e),
-                session_id=session_id,
-                chain_id=chain_id,
-            )
             print(f"[tts] rewarm failed: {e}", file=sys.stderr)
 
     threading.Thread(target=_warm, daemon=True).start()
 
 
-def summarize(session_id: str, assistant_text: str) -> str:
+def _tag(is_final: bool) -> str:
+    return "[FINAL REPLY]" if is_final else "[PROGRESS UPDATE]"
+
+
+def tagged_body(text: str, is_final: bool) -> str:
+    """Render an assistant turn as the message body the model summarizes.
+
+    Prefixes the [PROGRESS UPDATE]/[FINAL REPLY] tag the system prompt keys on.
+    Shared with the dataset/label tooling so train and serve render identically."""
+    return f"{_tag(is_final)}\n{text}"
+
+
+def first_turn_prompt(pending: str, body: str) -> str:
+    """Wrap the first turn's body with the human prompt that opened the chain.
+
+    Only the first turn carries the prompt; later turns rely on message history."""
+    return f"User asked:\n{pending}\n\n{body}"
+
+
+def summarize(session_id: str, assistant_text: str, is_final: bool) -> str:
+    """Summarize one assistant message for TTS.
+
+    `is_final` carries the character of the message: True for the concluding
+    reply of a turn (stop_reason=end_turn), False for an intermediate progress
+    update. It's tagged into the message body so the model can frame the
+    summary accordingly (present-tense for progress, wrap-up for final)."""
     with _state_lock:
         history = list(_histories.get(session_id, []))
         pending = _pending_prompts.get(session_id)
-        chain_id = _chain_ids.get(session_id)
-    if not history:
-        if pending:
-            prompt = f"User asked:\n{pending}\n\nAssistant replied:\n{assistant_text}"
-        else:
-            prompt = assistant_text
+    body = tagged_body(assistant_text, is_final)
+    if not history and pending:
+        prompt = first_turn_prompt(pending, body)
     else:
-        prompt = assistant_text
+        prompt = body
 
     agent = _get_agent()
-    request_payload = {
-        "session": session_id,
-        "prompt": prompt,
-        "history": ModelMessagesTypeAdapter.dump_python(history),
-    }
-    try:
-        with _runtime_lock:
-            result = agent.run_sync(
-                prompt, message_history=history, model_settings=MODEL_SETTINGS
-            )
-    except Exception as e:
-        _log_io(
-            "summarize",
-            request_payload,
-            None,
-            error=repr(e),
-            session_id=session_id,
-            chain_id=chain_id,
+    with _runtime_lock:
+        result = agent.run_sync(
+            prompt, message_history=history, model_settings=MODEL_SETTINGS
         )
-        raise
 
     new_history = list(result.all_messages())
     with _state_lock:
@@ -316,14 +267,6 @@ def summarize(session_id: str, assistant_text: str) -> str:
         _pending_prompts.pop(session_id, None)
 
     output = (result.output or "").strip()
-    history_dump = ModelMessagesTypeAdapter.dump_python(new_history)
-    _log_io(
-        "summarize",
-        request_payload,
-        {"output": output, "history": history_dump},
-        session_id=session_id,
-        chain_id=chain_id,
-    )
     _bump_idle_timer()
     return output
 
