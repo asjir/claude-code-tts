@@ -38,8 +38,9 @@ SYSTEM_PROMPT = (
     "Each message to summarize is tagged [PROGRESS UPDATE] or [FINAL REPLY]. "
     "For a progress update, say what the assistant is doing right now, in the "
     "present tense (e.g. 'Editing the config file'). For a final reply, say what "
-    "was accomplished or found, as a wrap-up. Never read the tag aloud.",
-    "If the message needs the user to read it, only output the prompt for them to do so.",
+    "was accomplished or found, as a wrap-up. Never read the tag aloud. "
+    "If the message needs the user to read it, only output the prompt for them "
+    "to do so."
 )
 
 # Disable Qwen3's <think> chain — we want fast direct summaries, not reasoning.

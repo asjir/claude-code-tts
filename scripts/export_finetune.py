@@ -35,8 +35,14 @@ REPO_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_OUT_DIR = REPO_DIR / "datasets" / "finetune"
 
 
-def load_outputs(md_path: Path) -> dict[str, str]:
-    """Return {id: curated output}; exit if any cell is empty or italic."""
+def load_outputs(md_path: Path, accept_italic: bool = False) -> dict[str, str]:
+    """Return {id: curated output}; exit if any cell is unusable.
+
+    With `accept_italic`, an *italic* cell is taken at face value — its inner
+    text becomes the output (the `*` are stripped). This treats every auto
+    proposal as accepted, so a not-yet-reviewed document still exports. Empty
+    cells always fail. Without the flag, italic cells fail too (strict
+    convergence)."""
     outputs: dict[str, str] = {}
     unconverged: list[tuple[str, str]] = []
     for line in md_path.read_text(encoding="utf-8").splitlines():
@@ -44,11 +50,13 @@ def load_outputs(md_path: Path) -> dict[str, str]:
         if parsed is None:
             continue
         rid, cell = parsed
-        state, _ = classify(cell)
-        if state != "plain":
-            unconverged.append((rid, state))
-        else:
+        state, hint = classify(cell)
+        if state == "plain":
             outputs[rid] = cell.strip()
+        elif state == "italic" and accept_italic:
+            outputs[rid] = hint
+        else:
+            unconverged.append((rid, state))
     if unconverged:
         sample = ", ".join(f"{rid}({st})" for rid, st in unconverged[:10])
         more = "" if len(unconverged) <= 10 else f" (+{len(unconverged) - 10} more)"
@@ -111,9 +119,14 @@ def main() -> None:
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--val-frac", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--accept-italic",
+        action="store_true",
+        help="take *italic* (unreviewed) proposals at face value instead of failing",
+    )
     args = parser.parse_args()
 
-    outputs = load_outputs(args.md)
+    outputs = load_outputs(args.md, accept_italic=args.accept_italic)
     raw = load_raw(args.raw)
     missing = [rid for rid in raw if rid not in outputs]
     if missing:
