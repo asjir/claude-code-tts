@@ -23,7 +23,12 @@ from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.providers.openai import OpenAIProvider
 
-MODEL = "qwen3.5:2b-mlx"
+# Preferred finetuned model; falls back to the generic base when the
+# finetune hasn't been built/pulled. Resolved against the running server's
+# installed models in ensure_server().
+FINETUNED_MODEL = "qwen3.5-2b-tts"
+FALLBACK_MODEL = "qwen3.5:2b-mlx"
+MODEL = FINETUNED_MODEL
 OLLAMA_URL = "http://localhost:11434"
 
 SYSTEM_PROMPT = (
@@ -103,10 +108,59 @@ def _cancel_idle_timer() -> None:
             _idle_timer = None
 
 
+def _resolve_model() -> None:
+    """Pick the finetuned model if installed, else the generic base.
+
+    Queries the running server's /api/tags so a missing finetune silently
+    falls back instead of erroring on the first summarize."""
+    global MODEL
+    try:
+        with urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=2) as resp:
+            tags = json.load(resp)
+    except Exception:
+        return  # leave MODEL at its default; let downstream calls surface errors
+    installed = {m.get("name", "") for m in tags.get("models", [])}
+    # Ollama reports names tag-qualified (e.g. "qwen3.5-2b-tts:latest").
+    names = installed | {n.split(":", 1)[0] for n in installed}
+    if FINETUNED_MODEL in names:
+        MODEL = FINETUNED_MODEL
+    elif FALLBACK_MODEL in names:
+        MODEL = FALLBACK_MODEL
+        print(
+            f"[tts] {FINETUNED_MODEL} not installed, using {FALLBACK_MODEL}",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"[tts] neither {FINETUNED_MODEL} nor {FALLBACK_MODEL} installed; "
+            f"pulling {FALLBACK_MODEL}...",
+            file=sys.stderr,
+        )
+        if _pull_model(FALLBACK_MODEL):
+            MODEL = FALLBACK_MODEL
+        else:
+            print(
+                f"[tts] pull of {FALLBACK_MODEL} failed; defaulting to {MODEL}",
+                file=sys.stderr,
+            )
+
+
+def _pull_model(name: str) -> bool:
+    """Download a model via the ollama CLI, streaming progress to stderr.
+
+    Returns True on success. Blocking — only called from the cold-start path
+    when no usable model is installed."""
+    try:
+        return subprocess.run(["ollama", "pull", name]).returncode == 0
+    except Exception:
+        return False
+
+
 def ensure_server() -> None:
     global _ollama_proc
     try:
         urllib.request.urlopen(f"{OLLAMA_URL}/api/version", timeout=1).read()
+        _resolve_model()
         return
     except Exception:
         pass
@@ -120,6 +174,7 @@ def ensure_server() -> None:
     for _ in range(40):
         try:
             urllib.request.urlopen(f"{OLLAMA_URL}/api/version", timeout=1).read()
+            _resolve_model()
             return
         except Exception:
             time.sleep(0.25)
@@ -267,9 +322,24 @@ def summarize(session_id: str, assistant_text: str, is_final: bool) -> str:
         _histories[session_id] = new_history
         _pending_prompts.pop(session_id, None)
 
-    output = (result.output or "").strip()
+    output = _strip_think(result.output or "")
     _bump_idle_timer()
     return output
+
+
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def _strip_think(text: str) -> str:
+    """Remove Qwen3.5 ``<think>...</think>`` blocks from a reply.
+
+    Our fine-tune was trained with ``enable_thinking=False``, which bakes an
+    empty ``<think></think>`` marker into every reply. Ollama doesn't strip it
+    when ``reasoning_effort=none`` (it isn't in think-parsing mode), so we drop
+    it here before the text reaches TTS. Also clears any stray, unbalanced tag."""
+    text = _THINK_RE.sub("", text)
+    text = text.replace("<think>", "").replace("</think>", "")
+    return text.strip()
 
 
 def verbalize(text: str) -> str:

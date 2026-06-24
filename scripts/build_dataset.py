@@ -41,8 +41,8 @@ DEFAULT_OUTPUT = REPO_DIR / "datasets" / "base_0.jsonl"
 def find_project(query: str) -> Path:
     """Find the project dir under PROJECTS_ROOT whose name best matches `query`.
 
-    Mirrors tts_watch.resolve_scope: shortest dir name containing `query`
-    (case-insensitive), ties broken by most-recently-modified."""
+    Shortest dir name containing `query` (case-insensitive), ties broken by
+    most-recently-modified."""
     q = query.lower()
     candidates = [
         d for d in PROJECTS_ROOT.iterdir() if d.is_dir() and q in d.name.lower()

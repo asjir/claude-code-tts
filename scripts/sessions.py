@@ -45,6 +45,34 @@ def classify_turn(line: str) -> tuple[str, str, bool] | None:
     return None
 
 
+def classify_codex_turn(line: str) -> tuple[str, str, bool] | None:
+    """Classify a Codex rollout `event_msg` line, mirroring `classify_turn`.
+
+    Returns ("human_prompt", text, False), ("assistant_text", text, is_final),
+    or None. Codex's `event_msg` stream is the clean analog of Claude's
+    transcript: `user_message` is the human prompt (without the AGENTS.md
+    preamble that pollutes the raw `response_item`), and `agent_message` is
+    assistant text, with `phase == "final_answer"` marking the concluding
+    reply (analogous to Claude's stop_reason == "end_turn") vs "commentary"
+    for progress updates."""
+    try:
+        rec = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if rec.get("type") != "event_msg":
+        return None
+    p = rec.get("payload") or {}
+    p_type = p.get("type")
+    if p_type == "user_message":
+        text = (p.get("message") or "").strip()
+        return ("human_prompt", text, False) if text else None
+    if p_type == "agent_message":
+        text = (p.get("message") or "").strip()
+        is_final = p.get("phase") == "final_answer"
+        return ("assistant_text", text, is_final) if text else None
+    return None
+
+
 def iter_turns(path: Path) -> Iterator[tuple[str, str, bool]]:
     """Yield classified turns from a full session JSONL, in file order.
 

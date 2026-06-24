@@ -6,6 +6,14 @@ Run without hooks etc:
 uv run scripts/tts_watch.py
 ```
 
+`tts_watch` tails **all active Claude Code *and* Codex sessions** at once,
+speaking a summary of each new assistant turn (the newest utterance interrupts
+whatever is currently speaking). By default (`--accent mixed`) Codex turns are
+read in a random American voice and Claude turns in a random British voice, so
+you can tell the two tools apart by ear; `--accent american|british` forces one
+pool for both. Pass a substring as the sole positional arg to scope to sessions
+whose Claude project dir / Codex working directory matches it.
+
 Automatic TTS (text-to-speech) integration for Claude Code using the [Kokoro TTS model](https://github.com/nazdridoy/kokoro-tts). This project provides voice feedback that reads Claude's responses aloud as you work.
 
 ## Features
